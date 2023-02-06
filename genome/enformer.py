@@ -1,10 +1,33 @@
+# torch.jit.script-compatible version of https://github.com/lucidrains/enformer-pytorch
+# MIT License
+
+# Copyright (c) 2021 Phil Wang
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 import math
 import torch
-from torch import nn, einsum
+from torch import nn, einsum, Tensor
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint_sequential
 
-from einops import rearrange, reduce
+# from einops import rearrange, reduce
 from einops.layers.torch import Rearrange
 
 from enformer_pytorch.data import str_to_one_hot, seq_indices_to_one_hot
@@ -12,6 +35,8 @@ from enformer_pytorch.data import str_to_one_hot, seq_indices_to_one_hot
 from enformer_pytorch.config_enformer import EnformerConfig
 
 from transformers import PreTrainedModel
+from transformers.configuration_utils import PretrainedConfig
+from transformers.generation import GenerationConfig
 
 # constants
 
@@ -61,7 +86,7 @@ def pearson_corr_coef(x, y, dim=1, reduce_dims=(-1,)):
 # relative positional encoding functions
 
 
-def get_positional_features_exponential(positions, features, seq_len, min_half_life=3.0):
+def get_positional_features_exponential(positions, features: int, seq_len: int, min_half_life: float = 3.0) -> Tensor:
     max_range = math.log(seq_len) / math.log(2.0)
     half_life = 2 ** torch.linspace(min_half_life, max_range, features, device=positions.device)
     half_life = half_life[None, ...]
@@ -69,7 +94,7 @@ def get_positional_features_exponential(positions, features, seq_len, min_half_l
     return torch.exp(-math.log(2.0) / half_life * positions)
 
 
-def get_positional_features_central_mask(positions, features, seq_len):
+def get_positional_features_central_mask(positions, features: int) -> Tensor:
     center_widths = 2 ** torch.arange(1, features + 1, device=positions.device).float()
     center_widths = center_widths - 1
     return (center_widths[None, ...] > positions.abs()[..., None]).float()
@@ -81,12 +106,9 @@ def gamma_pdf(x, concentration, rate):
     return torch.exp(log_unnormalized_prob - log_normalization)
 
 
-def get_positional_features_gamma(positions, features, seq_len, stddev=None, start_mean=None, eps=1e-8):
-    if not exists(stddev):
-        stddev = seq_len / (2 * features)
-
-    if not exists(start_mean):
-        start_mean = seq_len / features
+def get_positional_features_gamma(positions, features: int, seq_len: int, eps: float = 1e-8) -> Tensor:
+    stddev = seq_len / (2 * features)
+    start_mean = seq_len / features
 
     mean = torch.linspace(start_mean, seq_len, features, device=positions.device)
     mean = mean[None, ...]
@@ -98,27 +120,30 @@ def get_positional_features_gamma(positions, features, seq_len, stddev=None, sta
     return outputs
 
 
-def get_positional_embed(seq_len, feature_size, device):
+def get_positional_embed(seq_len: int, feature_size: int, device: torch.device):
     distances = torch.arange(-seq_len + 1, seq_len, device=device)
 
-    feature_functions = [
-        get_positional_features_exponential,
-        get_positional_features_central_mask,
-        get_positional_features_gamma,
-    ]
+    # feature_functions = [
+    #     get_positional_features_exponential,
+    #     get_positional_features_central_mask,
+    #     get_positional_features_gamma,
+    # ]
 
-    num_components = len(feature_functions) * 2
+    num_components = 3 * 2
 
     if (feature_size % num_components) != 0:
         raise ValueError(f"feature size is not divisible by number of components ({num_components})")
 
     num_basis_per_class = feature_size // num_components
 
-    embeddings = []
-    for fn in feature_functions:
-        embeddings.append(fn(distances, num_basis_per_class, seq_len))
-
-    embeddings = torch.cat(embeddings, dim=-1)
+    embeddings = torch.cat(
+        [
+            get_positional_features_exponential(distances, num_basis_per_class, seq_len),
+            get_positional_features_central_mask(distances, num_basis_per_class),
+            get_positional_features_gamma(distances, num_basis_per_class, seq_len),
+        ],
+        dim=-1,
+    )
     embeddings = torch.cat((embeddings, torch.sign(distances)[..., None] * embeddings), dim=-1)
     return embeddings
 
@@ -141,8 +166,8 @@ class Residual(nn.Module):
         super().__init__()
         self.fn = fn
 
-    def forward(self, x, **kwargs):
-        return self.fn(x, **kwargs) + x
+    def forward(self, x):
+        return self.fn(x) + x
 
 
 class GELU(nn.Module):
@@ -163,16 +188,26 @@ class AttentionPool(nn.Module):
         needs_padding = remainder > 0
 
         if needs_padding:
-            x = F.pad(x, (0, remainder), value=0)
+            x = F.pad(x, (0, remainder), value=0.0)
             mask = torch.zeros((b, 1, n), dtype=torch.bool, device=x.device)
-            mask = F.pad(mask, (0, remainder), value=True)
+            mask = F.pad(mask, (0, remainder), value=1.0)
 
-        x = self.pool_fn(x)
-        logits = self.to_attn_logits(x)
+            x = self.pool_fn(x)
+            logits = self.to_attn_logits(x)
 
-        if needs_padding:
-            mask_value = -torch.finfo(logits.dtype).max
+            if logits.dtype == torch.float16:
+                mask_value = -65504.0
+            elif logits.dtype == torch.float32:
+                mask_value = -3.4028234663852886e38
+            elif logits.dtype == torch.float64:
+                mask_value = -1.7976931348623157e308
+            else:
+                mask_value = -3.3895313892515355e38
+
             logits = logits.masked_fill(self.pool_fn(mask), mask_value)
+        else:
+            x = self.pool_fn(x)
+            logits = self.to_attn_logits(x)
 
         attn = logits.softmax(dim=-1)
 
@@ -237,33 +272,42 @@ class Attention(nn.Module):
         self.pos_dropout = nn.Dropout(pos_dropout)
         self.attn_dropout = nn.Dropout(dropout)
 
+        self.bnhd_to_bhnd = Rearrange("b n (h d) -> b h n d", h=self.heads)
+        self.nhd_to_hnd = Rearrange("n (h d) -> h n d", h=self.heads)
+        self.bhnd_to_bnhd = Rearrange("b h n d -> b n (h d)")
+
     def forward(self, x):
-        n, h, device = x.shape[-2], self.heads, x.device
+        n = x.shape[-2]
+        device = x.device
 
         q = self.to_q(x)
         k = self.to_k(x)
         v = self.to_v(x)
 
-        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q, k, v))
+        # CHANGED: Remove lambda
+        # q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q, k, v))
+        q = self.bnhd_to_bhnd(q)
+        k = self.bnhd_to_bhnd(k)
+        v = self.bnhd_to_bhnd(v)
 
         q = q * self.scale
 
-        content_logits = einsum("b h i d, b h j d -> b h i j", q + self.rel_content_bias, k)
+        content_logits = torch.einsum("b h i d, b h j d -> b h i j", (q + self.rel_content_bias).float(), k.float())
 
         positions = get_positional_embed(n, self.num_rel_pos_features, device)
         positions = self.pos_dropout(positions)
         rel_k = self.to_rel_k(positions)
 
-        rel_k = rearrange(rel_k, "n (h d) -> h n d", h=h)
-        rel_logits = einsum("b h i d, h j d -> b h i j", q + self.rel_pos_bias, rel_k)
+        rel_k = self.nhd_to_hnd(rel_k)
+        rel_logits = torch.einsum("b h i d, h j d -> b h i j", (q + self.rel_pos_bias).float(), rel_k.float())
         rel_logits = relative_shift(rel_logits)
 
         logits = content_logits + rel_logits
         attn = logits.softmax(dim=-1)
         attn = self.attn_dropout(attn)
 
-        out = einsum("b h i j, b h j d -> b h i d", attn, v)
-        out = rearrange(out, "b h n d -> b n (h d)")
+        out = torch.einsum("b h i j, b h j d -> b h i d", attn.float(), v.float())
+        out = self.bhnd_to_bnhd(out)
         return self.to_out(out)
 
 
@@ -274,12 +318,25 @@ class Enformer(PreTrainedModel):
     config_class = EnformerConfig
     base_model_prefix = "enformer"
 
+    # Override to remove type annotation
+    # @property
+    # def base_model(self):
+    #     """
+    #     `torch.nn.Module`: The main body of the model.
+    #     """
+    #     return self
+
     @staticmethod
     def from_hparams(**kwargs):
         return Enformer(EnformerConfig(**kwargs))
 
     def __init__(self, config):
-        super().__init__(config)
+        if isinstance(self, PreTrainedModel):
+            super().__init__(config)
+        else:
+            nn.Module.__init__(self)
+            self.config = config
+
         self.dim = config.dim
         half_dim = config.dim // 2
         twice_dim = config.dim * 2
@@ -361,6 +418,10 @@ class Enformer(PreTrainedModel):
         )
 
         # create trunk sequential module
+        self.bnd_to_bdn = Rearrange("b n d -> b d n")
+        self.bdn_to_bnd = Rearrange("b d n -> b n d")
+        self.unbatch_to_batch = Rearrange("... -> () ...")
+        self.batch_to_unbatch = Rearrange("() ... -> ...")
 
         self._trunk = nn.Sequential(
             Rearrange("b n d -> b d n"),
@@ -380,11 +441,14 @@ class Enformer(PreTrainedModel):
 
         self.use_checkpointing = config.use_checkpointing
 
-    def add_heads(self, **kwargs):
-        self.output_heads = kwargs
-
+    # CHANGED: remove lambda, kwargs
+    def add_heads(self, human=5313, mouse=1643):
+        self.output_heads = {"human": 5313, "mouse": 1643}
         self._heads = nn.ModuleDict(
-            map_values(lambda features: nn.Sequential(nn.Linear(self.dim * 2, features), nn.Softplus()), kwargs)
+            {
+                "human": nn.Sequential(nn.Linear(self.dim * 2, human), nn.Softplus()),
+                "mouse": nn.Sequential(nn.Linear(self.dim * 2, mouse), nn.Softplus()),
+            }
         )
 
     def set_target_length(self, target_length):
@@ -399,54 +463,69 @@ class Enformer(PreTrainedModel):
     def heads(self):
         return self._heads
 
-    def trunk_checkpointed(self, x):
-        x = rearrange(x, "b n d -> b d n")
-        x = self.stem(x)
-        x = self.conv_tower(x)
-        x = rearrange(x, "b d n -> b n d")
-        x = checkpoint_sequential(self.transformer, len(self.transformer), x)
-        x = self.crop_final(x)
-        x = self.final_pointwise(x)
+    # def trunk_checkpointed(self, x):
+    #     x = self.bnd_to_bdn(x)
+    #     x = self.stem(x)
+    #     x = self.conv_tower(x)
+    #     x = self.bdn_to_bnd(x)
+    #     x = checkpoint_sequential(self.transformer, len(self.transformer), x)
+    #     x = self.crop_final(x)
+    #     x = self.final_pointwise(x)
+    #     return x
+
+    def forward(self, x):
+        # if isinstance(x, list):
+        #     x = str_to_one_hot(x)
+
+        # elif x.dtype == torch.long:
+        #     x = seq_indices_to_one_hot(x)
+        x = x.float()
+        # no_batch = x.ndim == 2
+
+        # if no_batch:
+        #     x = self.unbatch_to_batch(x)
+
+        # if self.use_checkpointing:
+        #     x = self.trunk_checkpointed(x)
+        # else:
+        x = self._trunk(x)
+
+        # if no_batch:
+        #     x = self.batch_to_unbatch(x)
+
+        # if return_only_embeddings:
         return x
 
-    def forward(
-        self, x, target=None, return_corr_coef=False, return_embeddings=False, return_only_embeddings=False, head=None
-    ):
-        if isinstance(x, list):
-            x = str_to_one_hot(x)
+        # CHANGED: remove lambda
+        # out = map_values(lambda fn: fn(x), self._heads)
+        # out = {
+        #     'human': self._heads['human'](x),
+        #     'mouse': self._heads['mouse'](x),
+        # }
 
-        elif x.dtype == torch.long:
-            x = seq_indices_to_one_hot(x)
+        # if exists(head):
+        #     # assert head in self._heads, f"head {head} not found"
+        #     out = out[head]
 
-        no_batch = x.ndim == 2
+        # if exists(target):
+        #     # assert exists(head), "head must be passed in if one were to calculate loss directly with targets"
 
-        if no_batch:
-            x = rearrange(x, "... -> () ...")
+        #     if return_corr_coef:
+        #         return pearson_corr_coef(out, target)
 
-        trunk_fn = self.trunk_checkpointed if self.use_checkpointing else self._trunk
-        x = trunk_fn(x)
+        #     return poisson_loss(out, target)
 
-        if no_batch:
-            x = rearrange(x, "() ... -> ...")
+        # if return_embeddings:
+        #     return out, x
 
-        if return_only_embeddings:
-            return x
+        # return out
 
-        out = map_values(lambda fn: fn(x), self._heads)
 
-        if exists(head):
-            assert head in self._heads, f"head {head} not found"
-            out = out[head]
+RawEnformer = type("RawEnformer", (nn.Module,), dict(Enformer.__dict__))
 
-        if exists(target):
-            assert exists(head), "head must be passed in if one were to calculate loss directly with targets"
 
-            if return_corr_coef:
-                return pearson_corr_coef(out, target)
-
-            return poisson_loss(out, target)
-
-        if return_embeddings:
-            return out, x
-
-        return out
+def from_pretrained(path, *args, **kwargs):
+    model = Enformer.from_pretrained(path, *args, **kwargs)
+    raw_model = RawEnformer(model.config)
+    raw_model.load_state_dict(model.state_dict())
+    return raw_model
