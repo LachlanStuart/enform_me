@@ -1,0 +1,65 @@
+[project]
+name = "genome_analysis"
+description = ""
+version = "0.1.0"
+dependencies = [
+  "pandas",
+  "numpy",
+  # "vcfpy", # pysam doesn't install on windows :(
+  "tqdm>=4.64.0",
+  "gtfparse",
+  "kipoiseq",
+  "pyfaidx>=0.7.1",
+  "MonkeyType",
+  "enformer_pytorch",
+  "tables",
+  "openpyxl",
+  "lovely-tensors",
+  "torch @ https://download.pytorch.org/whl/nightly/cu118/torch-2.0.0.dev20230204%2Bcu118-cp310-cp310-win_amd64.whl",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black",
+    "pre-commit",
+    "ipython",
+]
+# nb = [
+#   "venv-kernel", # venv-kernel install --name "genome_analysis" --description "genome_analysis"
+# ]
+
+
+[tool.black]
+# https://github.com/psf/black
+target-version = ["py310"]
+line-length = 120
+color = true
+
+exclude = '''
+/(
+    \.git
+    | \.hg
+    | \.mypy_cache
+    | \.tox
+    | \.venv
+    | _build
+    | buck-out
+    | build
+    | dist
+    | env
+    | venv
+)/
+'''
+
+[tool.isort]
+# https://github.com/timothycrosley/isort/
+py_version = 310
+line_length = 120
+
+known_typing = ["typing", "types", "typing_extensions", "mypy", "mypy_extensions"]
+sections = ["FUTURE", "TYPING", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
+profile = "black"
+include_trailing_comma = true
+multi_line_output = 3
+indent = 4
+color_output = true
